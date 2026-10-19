@@ -63,6 +63,15 @@ internal static class Program
                 await new Migrator(store).DownloadAsync(source, token);
                 return store.Root;
             }
+            catch (IncompleteDownloadException exception) when (Input.Interactive && !token.IsCancellationRequested)
+            {
+                // An object-level 404/412 is not a failure of the connection or credentials.
+                Input.Error(exception.Message);
+                var choice = Input.Choice("Some source objects could not be saved:", token,
+                    ("retry", "List the bucket again and retry (reuse completed downloads)"),
+                    ("cancel", "Stop and keep all downloaded files and the error report"));
+                if (choice == "cancel") Cancel();
+            }
             catch (Exception exception) when (Input.Interactive && !token.IsCancellationRequested && IsConnectionProblem(exception))
             {
                 Explain(exception);

@@ -118,6 +118,7 @@ s3-migration/
   workspace.json             Source identity, bucket, completion flag, manifest hash/totals
   manifest.jsonl             Completed snapshot: one object record per line
   manifest.pending.jsonl     Present while a download is incomplete
+  download-errors.jsonl      Missing/changed object keys and S3 errors from the latest attempt
   files/
     images/logo.png          Ordinary keys retain their relative names and directories
     documents/report.pdf
@@ -139,9 +140,11 @@ Local paths are confined to the staging directory. The app rejects staging symli
 ## Verification and interruption
 
 - Source listings are paginated, so buckets larger than 1,000 objects are included.
+- URL-encoded object names are decoded once, supporting both `+` and `%20` as spaces while preserving a literal plus encoded as `%2B`.
 - Downloads stream to temporary files, calculate SHA-256, check the advertised length, then move the completed content into place.
 - Each downloaded object gets an atomic checkpoint. On another download, a matching source ETag, size, modification time, and local SHA-256 allow that object to be reused.
 - Uploading is allowed only after a complete source listing and successful downloads. A failed download marks the snapshot incomplete, even if an older completed manifest exists.
+- If an individual object returns `NoSuchKey`/HTTP 404 or changes after listing (HTTP 412), the app prints that exact key, records it in `download-errors.jsonl`, and continues with other objects. It then reports an incomplete download and offers a retry using existing checkpoints. It does not ask you to change working credentials for a missing object, commit a complete manifest, or begin an upload while listed objects are missing. The report is refreshed on each download attempt.
 - The completed manifest's SHA-256, object count, and byte count are checked before any destination writes, detecting a changed or truncated manifest.
 - Every local object is checked against its recorded SHA-256 before upload. Large uploads use the SDK's multipart transfer support with a part size selected to stay within the part-count limit.
 - Matching destination objects are read and hashed before being skipped. Each newly uploaded object is read back and checked for size, SHA-256, and preserved metadata. **Budget for the destination read traffic and `GetObject` permission.**

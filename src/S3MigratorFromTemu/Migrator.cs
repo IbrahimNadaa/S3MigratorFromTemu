@@ -13,10 +13,15 @@ internal sealed class Migrator(MigrationStore store)
     {
         store.State.SnapshotComplete = false;
         await store.SaveStateAsync(token);
-        long downloaded = 0, reused = 0, bytes = 0;
+        long downloaded = 0, reused = 0, failed = 0, bytes = 0;
         string? continuation = null;
+        const string errorReportRelativePath = "download-errors.jsonl";
 
         Console.WriteLine("Downloading all current objects (including folder markers)...");
+        await using var errors = new StreamWriter(store.PrepareFile(errorReportRelativePath), append: false, new UTF8Encoding(false))
+        {
+            AutoFlush = true
+        };
         await using (var pending = new StreamWriter(store.PrepareFile("manifest.pending.jsonl"), append: false, new UTF8Encoding(false)))
         {
             do
@@ -27,36 +32,62 @@ internal sealed class Migrator(MigrationStore store)
                     MaxKeys = 1000,
                     ContinuationToken = continuation,
                     // Explicit URL encoding permits keys that XML 1.0 cannot represent.
-                    // This SDK returns explicitly requested URL encoding without decoding it.
+                    // Decode exactly once below; MinIO represents spaces as '+' and literal '+' as '%2B'.
                     Encoding = EncodingType.Url
                 }, token);
 
                 foreach (var item in page.S3Objects ?? [])
                 {
                     token.ThrowIfCancellationRequested();
-                    var key = page.Encoding?.Value == "url" ? Uri.UnescapeDataString(item.Key) : item.Key;
+                    // URL decoding must handle both MinIO's '+' and S3's '%20' for spaces.
+                    // Decoding '%2B' once preserves an actual plus in an object name.
+                    var key = string.Equals(page.Encoding?.Value, "url", StringComparison.OrdinalIgnoreCase)
+                        ? WebUtility.UrlDecode(item.Key) : item.Key;
                     if (string.IsNullOrEmpty(key) || item.Size is null or < 0 || string.IsNullOrEmpty(item.ETag))
                         throw new IOException("The source returned an object without a key, size, or ETag.");
 
-                    var cached = await store.ReadCachedAsync(key, token);
-                    ObjectRecord entry;
-                    if (cached is not null && cached.Length == item.Size && cached.SourceETag == item.ETag &&
-                        cached.SourceLastModifiedUtc == item.LastModified?.ToUniversalTime() &&
-                        await TransferIO.LocalMatchesAsync(store.Resolve(cached.LocalPath), cached, token))
+                    try
                     {
-                        entry = cached;
-                        reused++;
-                        Console.WriteLine($"  reused {TransferIO.DisplayKey(key)} ({TransferIO.Bytes(entry.Length)})");
+                        var cached = await store.ReadCachedAsync(key, token);
+                        ObjectRecord entry;
+                        if (cached is not null && cached.Length == item.Size && cached.SourceETag == item.ETag &&
+                            cached.SourceLastModifiedUtc == item.LastModified?.ToUniversalTime() &&
+                            await TransferIO.LocalMatchesAsync(store.Resolve(cached.LocalPath), cached, token))
+                        {
+                            entry = cached;
+                            reused++;
+                            Console.WriteLine($"  reused {TransferIO.DisplayKey(key)} ({TransferIO.Bytes(entry.Length)})");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"  downloading {TransferIO.DisplayKey(key)} ({TransferIO.Bytes(item.Size.Value)})...");
+                            entry = await DownloadObjectAsync(source, item, key, store.AllocateLocalPath(key, cached), token);
+                            await store.SaveCachedAsync(entry, token);
+                            downloaded++;
+                            Console.WriteLine($"  saved {TransferIO.DisplayKey(key)} ({TransferIO.Bytes(entry.Length)})");
+                        }
+                        bytes = checked(bytes + entry.Length);
+                        await pending.WriteLineAsync(JsonSerializer.Serialize(entry, Settings.Json).AsMemory(), token);
                     }
-                    else
+                    catch (AmazonS3Exception exception) when (IsMissingOrChangedObject(exception) && !token.IsCancellationRequested)
                     {
-                        entry = await DownloadObjectAsync(source, item, key, store.AllocateLocalPath(key, cached), token);
-                        await store.SaveCachedAsync(entry, token);
-                        downloaded++;
-                        Console.WriteLine($"  saved {TransferIO.DisplayKey(key)} ({TransferIO.Bytes(entry.Length)})");
+                        failed++;
+                        var reason = exception.StatusCode == HttpStatusCode.PreconditionFailed || exception.ErrorCode == "PreconditionFailed"
+                            ? "The object changed between listing and download."
+                            : "The object was listed, but the server could not find the requested key.";
+                        Console.Error.WriteLine($"  failed {TransferIO.DisplayKey(key)}: {exception.ErrorCode} (HTTP {(int)exception.StatusCode}). {reason} Continuing with the remaining objects.");
+                        await errors.WriteLineAsync(JsonSerializer.Serialize(new
+                        {
+                            bucket = store.State.Bucket,
+                            key,
+                            listedKey = item.Key,
+                            listingEncoding = page.Encoding?.Value,
+                            errorCode = exception.ErrorCode,
+                            httpStatus = (int)exception.StatusCode,
+                            requestId = exception.RequestId,
+                            reason
+                        }, Settings.Json).AsMemory(), token);
                     }
-                    bytes = checked(bytes + entry.Length);
-                    await pending.WriteLineAsync(JsonSerializer.Serialize(entry, Settings.Json).AsMemory(), token);
                 }
 
                 if (page.IsTruncated is null)
@@ -71,6 +102,8 @@ internal sealed class Migrator(MigrationStore store)
         }
 
         token.ThrowIfCancellationRequested();
+        if (failed != 0)
+            throw new IncompleteDownloadException(failed, downloaded + reused, store.Resolve(errorReportRelativePath));
         File.Move(store.PendingManifestPath, store.ManifestPath, overwrite: true);
         await using (var manifest = TransferIO.OpenRead(store.ManifestPath))
             store.State.ManifestSha256 = await TransferIO.HashAsync(manifest, token);
@@ -132,6 +165,11 @@ internal sealed class Migrator(MigrationStore store)
 
     private static bool IsRetryableDownload(Exception exception) => exception is IOException or HttpRequestException ||
         exception is AmazonS3Exception s3 && ((int)s3.StatusCode >= 500 || s3.StatusCode == HttpStatusCode.RequestTimeout);
+
+    private static bool IsMissingOrChangedObject(AmazonS3Exception exception) =>
+        exception.ErrorCode is "NoSuchKey" or "PreconditionFailed" ||
+        exception.StatusCode == HttpStatusCode.PreconditionFailed ||
+        exception.StatusCode == HttpStatusCode.NotFound && exception.ErrorCode != "NoSuchBucket";
 
     public async Task UploadAsync(IAmazonS3 target, string region, bool overwrite, CancellationToken token)
     {
