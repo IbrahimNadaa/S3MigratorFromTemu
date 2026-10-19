@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+*.user
+migration.json
+s3-migration/
+*.zip

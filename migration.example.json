@@ -1,0 +1,18 @@
+{
+  "bucket": "my-bucket",
+  "workDirectory": "./s3-migration",
+  "source": {
+    "url": "http://localhost:9000",
+    "clientId": "",
+    "secret": "",
+    "region": "us-east-1",
+    "forcePathStyle": true
+  },
+  "target": {
+    "url": "https://destination.example.com",
+    "clientId": "",
+    "secret": "",
+    "region": "us-east-1",
+    "forcePathStyle": true
+  }
+}

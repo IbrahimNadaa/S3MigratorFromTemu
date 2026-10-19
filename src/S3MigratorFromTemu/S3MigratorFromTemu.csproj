@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>s3-migrator-from-temu</AssemblyName>
+    <RootNamespace>S3MigratorFromTemu</RootNamespace>
+    <Product>s3 migrator from temu</Product>
+    <Description>Download a MinIO/S3 bucket to disk and migrate it to another S3 server.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.S3" Version="4.0.104.3" />
+  </ItemGroup>
+</Project>
