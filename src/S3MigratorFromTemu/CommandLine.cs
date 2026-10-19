@@ -4,15 +4,16 @@ internal sealed class CommandLine
 {
     private static readonly HashSet<string> ValueOptions = new(StringComparer.Ordinal)
     {
-        "config", "workdir", "bucket",
+        "config", "workdir", "directory", "bucket",
         "source-url", "source-client-id", "source-secret", "source-region", "source-session-token",
         "target-url", "target-client-id", "target-secret", "target-region", "target-session-token"
     };
 
     private readonly Dictionary<string, string> values = new(StringComparer.Ordinal);
-    public string Command { get; private set; } = "migrate";
+    public string Command { get; private set; } = "";
     public bool Help { get; private set; }
     public bool Overwrite { get; private set; }
+    public void EnableOverwrite() => Overwrite = true;
     public string? Get(string name) => values.GetValueOrDefault(name);
 
     public static CommandLine Parse(string[] args)
@@ -24,7 +25,7 @@ internal sealed class CommandLine
             result.Command = args[0].ToLowerInvariant();
             index++;
         }
-        if (result.Command is not ("migrate" or "download" or "upload"))
+        if (result.Command is not ("" or "migrate" or "download" or "upload"))
             throw new ArgumentException("Command must be migrate, download, or upload. Use --help.");
 
         for (; index < args.Length; index++)
@@ -43,6 +44,17 @@ internal sealed class CommandLine
         return result;
     }
 
+    public void SelectCommand(CancellationToken token)
+    {
+        if (Command.Length != 0) return;
+        Command = Input.Interactive
+            ? Input.Choice("What would you like to do?", token,
+                ("download", "Save an S3 bucket to the filesystem only"),
+                ("upload", "Upload from a local directory"),
+                ("migrate", "Download a bucket and upload it now"))
+            : "download";
+    }
+
     public const string HelpText = """
         s3 migrator from temu
 
@@ -50,14 +62,16 @@ internal sealed class CommandLine
           dotnet run --project src/S3MigratorFromTemu -- [command] [options]
 
         Commands:
-          migrate     Download the entire bucket, then upload it (default).
-          download    Download to disk and commit a complete manifest.
-          upload      Upload a completed local snapshot; source credentials not needed.
+          download    Save to the filesystem only; no target details needed.
+          upload      Upload a snapshot or ordinary local folder; no source details needed.
+          migrate     Download the entire bucket, then upload it immediately.
+          No command  Show the action menu (default choice: download only).
 
         Options:
           --config <file>                  Optional JSON settings file.
           --workdir <directory>            Local staging directory (default ./s3-migration).
-          --bucket <name>                  Source AND destination bucket name.
+          --directory <directory>          Folder to upload; snapshot roots auto-detected.
+          --bucket <name>                  Source bucket; target bucket for ordinary folders.
           --source-url <url>               S3 API endpoint, e.g. http://localhost:9000.
           --source-client-id <access-key>  MinIO access key ID (not an OAuth client ID).
           --source-secret <secret>         Prefer an environment variable or masked prompt.

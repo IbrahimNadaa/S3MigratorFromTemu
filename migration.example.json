@@ -1,6 +1,7 @@
 {
   "bucket": "my-bucket",
   "workDirectory": "./s3-migration",
+  "uploadDirectory": "./s3-migration",
   "source": {
     "url": "http://localhost:9000",
     "clientId": "",

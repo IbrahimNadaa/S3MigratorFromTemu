@@ -1,18 +1,26 @@
 # s3 migrator from temu
 
-A C# / .NET 10 console application that downloads every current object in a MinIO/S3 bucket to the local filesystem, then uploads that completed snapshot to another S3 server using **the same bucket name and exact object keys**.
+A C# / .NET 10 console application that saves a MinIO/S3 bucket to the filesystem and lets you upload it to another S3 server later, preserving **the same bucket name and exact object keys**. It can also upload an ordinary local directory, preserving its relative filenames and subdirectories.
 
-The source project is supplied without running a build or adding tests, as requested. No migration has been run against a real server.
+This update was prepared with source syntax checks only. No build was run and no tests were added.
 
 ## Quick start
 
 Requires the .NET 10 SDK and enough disk space for the full bucket. From this project directory, run:
 
 ```powershell
-dotnet run --project ./src/S3MigratorFromTemu -- migrate
+dotnet run --project ./src/S3MigratorFromTemu
 ```
 
-Enter the source URL, bucket name, source access key ID and secret, and destination connection details when prompted. Secrets are masked. In MinIO, the requested **client ID means the S3 access key ID**, such as a service account's access key; it is not an OAuth/OIDC client ID.
+Choose an action from the startup menu:
+
+1. **Save an S3 bucket to the filesystem only** (default).
+2. **Upload from a local directory**.
+3. **Download a bucket and upload it now**.
+
+The save-only option asks for the source connection, bucket, and save directory. It finishes after saving and never asks for destination details. You can close the app and upload in a later session. Upload-only asks for the local directory and destination connection; source credentials are not needed. Immediate migration asks for target details after the download succeeds.
+
+Secrets are masked. In MinIO, the requested **client ID means the S3 access key ID**, such as a service account's access key; it is not an OAuth/OIDC client ID.
 
 Use the S3 API endpoint (often port `9000` for MinIO), for example `http://localhost:9000`. Supply the bucket separately. A MinIO console URL (often port `9001`) is not an S3 API URL.
 
@@ -20,18 +28,17 @@ If the destination bucket is missing, the app creates it. If it already exists, 
 
 ## Configure endpoints and credentials
 
-Copy `migration.example.json` to `migration.json` and set the bucket and both API URLs. Leave credentials blank in the file and use environment variables or masked prompts:
+Copy `migration.example.json` to `migration.json` and set the bucket and the API URL needed for your chosen action. Leave credentials blank in the file and use environment variables or masked prompts:
 
 ```powershell
 $env:S3M_SOURCE_CLIENT_ID = 'source-access-key'
-$env:S3M_TARGET_CLIENT_ID = 'target-access-key'
 
 # Set secrets from your existing secret manager/environment, or leave them
 # unset and the app will prompt with masked input.
-dotnet run --project ./src/S3MigratorFromTemu -- migrate --config ./migration.json
+dotnet run --project ./src/S3MigratorFromTemu -- download --config ./migration.json
 ```
 
-You can set `S3M_SOURCE_SECRET` and `S3M_TARGET_SECRET` for unattended runs. Credentials are never written into migration state. Configuration supports `clientId`, `secret`, and optional `sessionToken` if you choose to supply them there. Keep a credential-bearing configuration file private; `migration.json` is gitignored.
+You can set `S3M_SOURCE_SECRET` for unattended downloads. Set `S3M_TARGET_CLIENT_ID` and `S3M_TARGET_SECRET` when uploading later, or enter them at the masked prompts. Credentials are never written into migration state. Configuration supports `clientId`, `secret`, and optional `sessionToken` if you choose to supply them there. Keep a credential-bearing configuration file private; `migration.json` is gitignored.
 
 Settings use this precedence: **command-line value > environment variable > configuration file > prompt/default**. Relative paths are resolved against the current working directory.
 
@@ -39,6 +46,7 @@ Settings use this precedence: **command-line value > environment variable > conf
 | --- | --- | --- |
 | Bucket | `S3M_BUCKET` | Prompt during download/migrate; read from snapshot during upload |
 | Local directory | `S3M_WORKDIR` | `./s3-migration` |
+| Directory to upload | `S3M_DIRECTORY` | Ask, with the configured work directory as the default |
 | Source S3 API URL | `S3M_SOURCE_URL` | Prompt |
 | Source access key ID | `S3M_SOURCE_CLIENT_ID` | Prompt |
 | Source secret key | `S3M_SOURCE_SECRET` | Masked prompt |
@@ -52,20 +60,32 @@ Settings use this precedence: **command-line value > environment variable > conf
 
 The JSON `forcePathStyle` setting defaults to `true` independently for both endpoints, which suits MinIO. Set it to `false` if your provider requires virtual-hosted addressing. Use the actual region of each server. TLS certificates use normal system validation.
 
-For piped/noninteractive input, required settings must be supplied through arguments, environment variables, or configuration; the app does not read secrets from standard input.
+For piped/noninteractive input, required settings must be supplied through arguments, environment variables, or configuration; the app does not read secrets from standard input. Without an explicit command, unattended runs use download-only. Invalid unattended inputs return an error instead of waiting for an answer.
 
 ## Download now, upload later
 
 ```powershell
 # Needs only the source connection. Downloads the entire bucket to disk.
-dotnet run --project ./src/S3MigratorFromTemu -- download --config ./migration.json
+dotnet run --project ./src/S3MigratorFromTemu -- download --config ./migration.json --workdir 'D:\s3-backup'
 
 # Needs only the target connection and the completed local snapshot.
-dotnet run --project ./src/S3MigratorFromTemu -- upload --config ./migration.json
+dotnet run --project ./src/S3MigratorFromTemu -- upload --config ./migration.json --directory 'D:\s3-backup'
 
 # Explicitly allow replacing different objects already at the destination.
-dotnet run --project ./src/S3MigratorFromTemu -- upload --config ./migration.json --overwrite
+dotnet run --project ./src/S3MigratorFromTemu -- upload --config ./migration.json --directory 'D:\s3-backup' --overwrite
 ```
+
+For a downloaded bucket, select the **whole snapshot folder**, such as `D:\s3-backup`, containing `workspace.json` and `manifest.jsonl`. The app detects the snapshot, uses its original bucket name, and restores exact object keys from the manifest. Do not select its `files`, `special`, `cache`, or `partials` subdirectory.
+
+You can also upload an ordinary directory that was not created by the app:
+
+```powershell
+dotnet run --project ./src/S3MigratorFromTemu -- upload --directory 'D:\photos-to-upload' --bucket 'my-bucket'
+```
+
+For example, `D:\photos-to-upload\holidays\image.jpg` becomes `holidays/image.jpg` in `my-bucket`. Empty subdirectories become zero-byte folder marker objects. All files, including hidden files, are included. Symlinks and junctions are rejected rather than followed. No migration state is written into an ordinary upload directory. New ordinary files use content type `application/octet-stream`; there is no original S3 metadata to restore. Existing objects with identical bytes are verified and skipped, retaining their metadata. Keep the directory unchanged while uploading.
+
+`--directory` is also available as JSON `uploadDirectory` or environment variable `S3M_DIRECTORY`. The older `upload --workdir <directory>` form still works for snapshots. Command-line directory settings override environment/configuration settings.
 
 For a command-line-only configuration:
 
@@ -81,7 +101,15 @@ dotnet run --project ./src/S3MigratorFromTemu -- migrate `
 
 The app prompts for both secrets. `--source-secret` and `--target-secret` also exist for integrations, but their values can appear in shell history and process arguments. Prefer environment variables or the prompts.
 
-Run with `--help` for every command-line option. The default command is `migrate`.
+Run with `--help` for every command-line option. Without a command, interactive sessions show the action menu and default to save-only.
+
+## Correcting mistaken input
+
+Empty required values, invalid menu choices, malformed API URLs, invalid bucket names/regions, and missing or invalid directories show an explanation and ask for the affected input again. If a supplied argument, environment value, or configuration value is invalid in an interactive run, you can correct it at the prompt.
+
+The app checks the source connection and bucket before creating migration state. If the S3 server rejects a connection or credentials, choose the detail to correct (URL, access key, secret, region, session token, addressing style, or bucket where applicable) and retry. You can also retry unchanged settings or cancel with Ctrl+C. Secrets are never echoed during these corrections.
+
+Local transfer errors pause with choices to retry or select a different directory. When a target object already has different content, you can explicitly choose a retry that permits overwriting it. Completed downloads and matching uploads are reused. Interactive corrections apply to the current session; the app does not rewrite your configuration file or environment variables.
 
 ## Local files and exact object names
 
@@ -121,7 +149,7 @@ Local paths are confined to the staging directory. The app rejects staging symli
 - Requests use SDK retries. Interrupted download streams get up to three whole-object attempts. Retry by rerunning the same command; a partially transferred individual object starts again, while completed matching objects can be reused.
 - Press Ctrl+C to cancel. Exit codes: `0` success, `1` failure, `130` cancellation. Local data is retained. An interrupted multipart upload can leave unfinished parts on the server; the destination's multipart lifecycle cleanup can remove them.
 
-The app stops on the first unrecovered error and does not report a partial migration as successful. Upload retries may skip objects successfully transferred by an earlier run after verifying their content and metadata.
+Interactive runs pause on recoverable input/connection/transfer errors and offer correction or retry. Unattended runs return a nonzero exit code on errors. A partial migration is never reported as successful. Upload retries can skip objects successfully transferred by an earlier run after verifying their bytes (and original S3 metadata when uploading a snapshot).
 
 ## Scope and permissions
 

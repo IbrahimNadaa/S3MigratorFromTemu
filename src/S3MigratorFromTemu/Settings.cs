@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Amazon.Runtime;
@@ -10,6 +9,7 @@ internal sealed class Settings
 {
     public string? Bucket { get; set; }
     public string WorkDirectory { get; set; } = "./s3-migration";
+    public string? UploadDirectory { get; set; }
     public EndpointSettings? Source { get; set; }
     public EndpointSettings? Target { get; set; }
 
@@ -22,69 +22,117 @@ internal sealed class Settings
     public static async Task<Settings> LoadAsync(CommandLine options, CancellationToken token)
     {
         var configPath = options.Get("config");
-        var settings = configPath is null
-            ? new Settings()
-            : JsonSerializer.Deserialize<Settings>(await File.ReadAllTextAsync(configPath, token), Json)
-                ?? throw new ArgumentException("The configuration file is empty.");
+        var settings = new Settings();
+        while (configPath is not null)
+        {
+            try
+            {
+                settings = JsonSerializer.Deserialize<Settings>(await File.ReadAllTextAsync(configPath, token), Json)
+                    ?? throw new ArgumentException("The configuration file is empty.");
+                break;
+            }
+            catch (Exception exception) when (Input.IsInputError(exception) || exception is JsonException)
+            {
+                if (!Input.Interactive) throw;
+                Input.Error("Cannot read the configuration file. Check its path and JSON property names/values.");
+                var next = Input.Read("Configuration file (Enter to use prompts instead)", token, allowEmpty: true);
+                configPath = next.Length == 0 ? null : next;
+            }
+        }
 
-        settings.WorkDirectory = Value(options.Get("workdir"), Environment.GetEnvironmentVariable("S3M_WORKDIR"),
+        settings.WorkDirectory = First(options.Get("workdir"), Environment.GetEnvironmentVariable("S3M_WORKDIR"),
             settings.WorkDirectory) ?? "./s3-migration";
-        settings.Bucket = Value(options.Get("bucket"), Environment.GetEnvironmentVariable("S3M_BUCKET"), settings.Bucket);
+        settings.UploadDirectory = First(options.Get("directory"), options.Get("workdir"),
+            Environment.GetEnvironmentVariable("S3M_DIRECTORY"), Environment.GetEnvironmentVariable("S3M_WORKDIR"),
+            settings.UploadDirectory);
+        settings.Bucket = First(options.Get("bucket"), Environment.GetEnvironmentVariable("S3M_BUCKET"), settings.Bucket);
         if (options.Command != "upload")
         {
-            settings.Bucket = Required(settings.Bucket, "Bucket name");
-            settings.Source = ResolveEndpoint(options, "source", settings.Source);
+            settings.Bucket = Input.Read("Source bucket name", token, initial: settings.Bucket, normalize: Input.Bucket);
+            settings.Source = ResolveEndpoint(options, "source", settings.Source, token);
+            settings.WorkDirectory = Input.Read("Directory to save the files", token,
+                initial: First(options.Get("workdir"), Environment.GetEnvironmentVariable("S3M_WORKDIR")),
+                defaultValue: settings.WorkDirectory, normalize: value => Input.DirectoryPath(value, mustExist: false));
         }
         else
         {
             settings.Source = null;
+            settings.UploadDirectory = Input.Read("Directory to upload (snapshot folder or ordinary folder)", token,
+                initial: settings.UploadDirectory,
+                defaultValue: settings.WorkDirectory, normalize: value => Input.DirectoryPath(value, mustExist: true));
         }
-        settings.Target = options.Command == "download" ? null : ResolveEndpoint(options, "target", settings.Target);
         return settings;
     }
 
-    private static EndpointSettings ResolveEndpoint(CommandLine options, string side, EndpointSettings? configured)
+    public void ResolveTarget(CommandLine options, string? sourceUrl, CancellationToken token) =>
+        Target = ResolveEndpoint(options, "target", Target, token, sourceUrl);
+
+    private static EndpointSettings ResolveEndpoint(CommandLine options, string side, EndpointSettings? configured,
+        CancellationToken token, string? forbiddenUrl = null)
     {
         var endpoint = configured ?? new EndpointSettings();
-        string? Read(string name, string? fallback) => Value(options.Get($"{side}-{name}"),
+        string? Read(string name, string? fallback) => First(options.Get($"{side}-{name}"),
             Environment.GetEnvironmentVariable($"S3M_{side.ToUpperInvariant()}_{name.ToUpperInvariant().Replace('-', '_')}"), fallback);
-        endpoint.Url = EndpointSettings.NormalizeUrl(Required(Read("url", endpoint.Url), $"{side} S3 API URL"));
-        endpoint.ClientId = Required(Read("client-id", endpoint.ClientId), $"{side} access key ID (client ID)");
-        endpoint.Secret = Required(Read("secret", endpoint.Secret), $"{side} secret access key", secret: true);
-        endpoint.Region = Value(Read("region", endpoint.Region)) ?? "us-east-1";
+        endpoint.Url = Input.Read($"{side} S3 API URL", token, initial: Read("url", endpoint.Url),
+            normalize: value => EndpointSettings.ValidateUrl(value, forbiddenUrl));
+        endpoint.ClientId = Input.Read($"{side} access key ID (client ID)", token,
+            initial: Read("client-id", endpoint.ClientId), normalize: Input.Credential);
+        endpoint.Secret = Input.Read($"{side} secret access key", token, initial: Read("secret", endpoint.Secret),
+            normalize: Input.Credential, secret: true);
+        endpoint.Region = Input.Read($"{side} signing region", token, initial: Read("region", endpoint.Region),
+            defaultValue: "us-east-1", normalize: Input.Region);
         endpoint.SessionToken = Read("session-token", endpoint.SessionToken);
         return endpoint;
     }
 
-    private static string? Value(params string?[] values) => values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
-
-    private static string Required(string? value, string label, bool secret = false)
+    public void CorrectConnection(EndpointSettings endpoint, string side, bool allowBucketChange,
+        string? forbiddenUrl, CancellationToken token)
     {
-        if (!string.IsNullOrWhiteSpace(value)) return value;
-        if (Console.IsInputRedirected)
-            throw new ArgumentException($"Missing {label}. Supply it through configuration, arguments, or environment variables.");
-        Console.Write($"{label}: ");
-        if (!secret)
-            return Value(Console.ReadLine()?.Trim()) ?? throw new ArgumentException($"{label} is required.");
-
-        var buffer = new StringBuilder();
-        while (true)
+        var choices = new List<(string Value, string Label)>
         {
-            var key = Console.ReadKey(intercept: true);
-            if (key.Key == ConsoleKey.Enter) break;
-            if (key.Key == ConsoleKey.Backspace)
-            {
-                if (buffer.Length > 0) { buffer.Length--; Console.Write("\b \b"); }
-            }
-            else if (!char.IsControl(key.KeyChar))
-            {
-                buffer.Append(key.KeyChar);
-                Console.Write('*');
-            }
+            ("url", $"Change {side} S3 API URL"),
+            ("client", $"Change {side} access key ID"),
+            ("secret", $"Re-enter {side} secret access key"),
+            ("region", $"Change signing region (currently {endpoint.Region})"),
+            ("token", "Change/clear temporary session token"),
+            ("style", "Change path-style addressing"),
+            ("retry", "Retry with the same settings")
+        };
+        if (allowBucketChange) choices.Add(("bucket", "Change bucket name"));
+        choices.Add(("cancel", "Cancel"));
+        var change = Input.Choice("Correct the connection details:", token, choices.ToArray());
+        switch (change)
+        {
+            case "url":
+                endpoint.Url = Input.Read($"{side} S3 API URL", token, defaultValue: endpoint.Url,
+                    normalize: value => EndpointSettings.ValidateUrl(value, forbiddenUrl));
+                break;
+            case "client":
+                endpoint.ClientId = Input.Read($"{side} access key ID", token, defaultValue: endpoint.ClientId,
+                    normalize: Input.Credential);
+                break;
+            case "secret":
+                endpoint.Secret = Input.Read($"{side} secret access key", token, normalize: Input.Credential, secret: true);
+                break;
+            case "region":
+                endpoint.Region = Input.Read($"{side} signing region", token, defaultValue: endpoint.Region, normalize: Input.Region);
+                break;
+            case "token":
+                endpoint.SessionToken = First(Input.Read($"{side} session token (Enter to clear)", token, secret: true, allowEmpty: true));
+                break;
+            case "style":
+                endpoint.ForcePathStyle = Input.Choice("Use path-style addressing?", token,
+                    ("yes", "Yes (MinIO default)"), ("no", "No (virtual-hosted addressing)")) == "yes";
+                break;
+            case "bucket":
+                Bucket = Input.Read("Bucket name", token, defaultValue: Bucket, normalize: Input.Bucket);
+                break;
+            case "cancel":
+                throw new OperationCanceledException(new CancellationToken(canceled: true));
         }
-        Console.WriteLine();
-        return Value(buffer.ToString()) ?? throw new ArgumentException($"{label} is required.");
     }
+
+    private static string? First(params string?[] values) => values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
 }
 
 internal sealed class EndpointSettings
@@ -105,6 +153,14 @@ internal sealed class EndpointSettings
         return uri.GetLeftPart(UriPartial.Authority);
     }
 
+    public static string ValidateUrl(string value, string? forbiddenUrl)
+    {
+        var normalized = NormalizeUrl(value);
+        if (string.Equals(normalized, forbiddenUrl, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Choose a target S3 server different from the source server.");
+        return normalized;
+    }
+
     public AmazonS3Client CreateClient()
     {
         AWSCredentials credentials = string.IsNullOrWhiteSpace(SessionToken)
@@ -117,7 +173,6 @@ internal sealed class EndpointSettings
             ForcePathStyle = ForcePathStyle,
             RetryMode = RequestRetryMode.Standard,
             MaxErrorRetry = 4,
-            // Avoid optional checksum trailers that older S3-compatible servers may reject.
             RequestChecksumCalculation = RequestChecksumCalculation.WHEN_REQUIRED,
             ResponseChecksumValidation = ResponseChecksumValidation.WHEN_REQUIRED,
             Timeout = TimeSpan.FromHours(24)

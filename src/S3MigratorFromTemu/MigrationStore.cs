@@ -46,6 +46,14 @@ internal sealed class MigrationStore : IDisposable
             throw new IOException("No local snapshot exists. Run download first.");
         RejectLink(Root);
         Directory.CreateDirectory(Root);
+        // Check the selected directory before writing a lock file into it.
+        var initialStatePath = Resolve("workspace.json");
+        if (!File.Exists(initialStatePath))
+        {
+            if (!allowCreate) throw new IOException("No workspace.json found. Select a completed snapshot directory.");
+            if (Directory.EnumerateFileSystemEntries(Root).Any(path => Path.GetFileName(path) != ".migration.lock"))
+                throw new IOException("Choose an empty save directory or a matching existing snapshot.");
+        }
         var lockPath = Resolve(".migration.lock");
         try
         {
@@ -80,8 +88,7 @@ internal sealed class MigrationStore : IDisposable
 
     public void Initialize(string bucket, EndpointSettings source)
     {
-        if (!Regex.IsMatch(bucket, "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", RegexOptions.CultureInvariant))
-            throw new ArgumentException("Use a DNS-compatible S3 bucket name (3-63 lowercase letters, numbers, dots, or hyphens).");
+        Input.Bucket(bucket);
         if (State is not null)
         {
             if (State.Bucket != bucket || State.SourceUrl != source.Url || State.SourceRegion != source.Region)
